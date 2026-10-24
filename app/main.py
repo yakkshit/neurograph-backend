@@ -1,12 +1,14 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+import time
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from dotenv import load_dotenv
 from llama_cpp import Llama
 
-# Configure logging
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -16,10 +18,17 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Global model instance
+# Security setup
+security = HTTPBearer()
+API_KEY = os.getenv("API_KEY", "default-fallback-key")
+
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key. Use 'Bearer <YOUR_API_KEY>'")
+    return credentials.credentials
+
 llm = None
 
-# OpenAI-compatible Request Schema
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -27,9 +36,9 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     model: str = "neurograph-v1"
-    temperature: float = 0.7
+    temperature: float = 0.1  # Lowered to 0.1 to minimize repetition in tiny models
     top_p: float = 0.9
-    max_tokens: Optional[int] = 512
+    max_tokens: Optional[int] = 250
 
 class ChatChoice(BaseModel):
     index: int
@@ -54,27 +63,26 @@ async def load_model():
         raise FileNotFoundError(f"Model not found at {model_path}")
 
     logger.info(f"Loading NeuroGraph model from {model_path}...")
-    # Optimized for CPU inference
     llm = Llama(
         model_path=model_path,
         n_ctx=512,
         n_threads=int(os.getenv("CPU_THREADS", "2")),
-        n_gpu_layers=0, # Force CPU
-        verbose=False,
-        chat_format="chatml" # Matches our |system| |user| |assistant| format
+        n_gpu_layers=0,
+        verbose=False
     )
     logger.info("✅ NeuroGraph model loaded successfully!")
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(
+    request: ChatCompletionRequest,
+    api_key: str = Depends(verify_api_key) # Enforce API key
+):
     if llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     try:
-        # Extract user messages
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
-        # Inject the mandatory NeuroGraph system prompt if not present
         if not any(msg["role"] == "system" for msg in messages):
             system_prompt = (
                 "You are a cognitive router designed by CedzLabs. "
@@ -83,33 +91,43 @@ async def create_chat_completion(request: ChatCompletionRequest):
             )
             messages.insert(0, {"role": "system", "content": system_prompt})
 
-        # Generate response
-        response = llm.create_chat_completion(
-            messages=messages,
+        # Manual prompt formatting to match training
+        prompt = ""
+        for msg in messages:
+            prompt += f"|{msg['role']}| {msg['content']} "
+        prompt += "|assistant| "
+
+        # Generate with strict repetition penalty
+        output = llm(
+            prompt,
+            max_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
-            max_tokens=request.max_tokens,
-            stop=["|endoftext|"]
+            repeat_penalty=1.5,  # Critical for tiny models
+            stop=["|endoftext|", "\n\n", "territ"] # Aggressive stopping to prevent loops
         )
 
-        # Format to match OpenAI schema exactly
-        choice = response["choices"][0]
+        generated_text = output["choices"][0]["text"].strip()
+        prompt_tokens = output["usage"]["prompt_tokens"]
+        completion_tokens = output["usage"]["completion_tokens"]
+
         return ChatCompletionResponse(
             id=f"chatcmpl-{os.urandom(4).hex()}",
             object="chat.completion",
-            created=response.get("created", 0),
+            created=int(time.time()),
             model=request.model,
             choices=[
                 ChatChoice(
                     index=0,
-                    message=ChatMessage(
-                        role=choice["message"]["role"],
-                        content=choice["message"]["content"]
-                    ),
-                    finish_reason=choice.get("finish_reason", "stop")
+                    message=ChatMessage(role="assistant", content=generated_text),
+                    finish_reason="stop"
                 )
             ],
-            usage=response.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
         )
 
     except Exception as e:
