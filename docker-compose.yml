@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  neurograph-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the model file from the host into the container
+      - ./models:/app/models
+    environment:
+      - CPU_THREADS=2
+    restart: unless-stopped
+    # For handling "a million requests", we can scale this horizontally:
+    # docker-compose up -d --scale neurograph-api=4
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
